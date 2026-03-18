@@ -78,8 +78,7 @@ Extend the Open SWE Agent framework to support **Bitbucket Data Center** code re
 │  5. Select 2-6 review roles based on changes + tech stack   │
 │  6. Spawn independent review sub-agents (parallel)          │
 │  7. Collect findings, deduplicate, validate                 │
-│  8. Post inline comments (per Critical/Major finding)       │
-│  9. Post summary comment (table format)                     │
+│  8. Post single summary comment (table format, no inlines)  │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -136,13 +135,14 @@ Register in `agent/webapp.py` alongside existing webhook routes.
 Wrapper around MCP tool calls for Bitbucket operations:
 - `get_pr_details(project, repo, pr_id)` — PR metadata (source/target branch, title, description, author)
 - `get_pr_diff(project, repo, pr_id)` — Full diff content
-- `get_pr_files(project, repo, pr_id)` — List of changed files with change type (added/modified/deleted)
 - `get_file_content(project, repo, file_path, ref)` — Fetch file at specific ref (for surrounding context)
-- `add_comment(project, repo, pr_id, text)` — Post general PR comment (summary)
-- `add_inline_comment(project, repo, pr_id, file_path, line, text)` — Post inline comment on specific line
-- `get_pr_comments(project, repo, pr_id)` — Fetch existing comments (to avoid duplicates on re-review)
+- `browse_repository(project, repo, path, ref)` — Explore repo structure for tech stack detection
+- `add_comment(project, repo, pr_id, text)` — Post summary review comment
+- `get_pr_comments(project, repo, pr_id)` — Fetch existing comments (context on re-review)
 
-This layer abstracts MCP tool calls so the review logic doesn't care about the underlying transport.
+**Not enabled (POC):** `add_comment_inline` (no inline comments to avoid PR clutter), `create_pull_request`, `merge_pull_request`, `decline_pull_request`, `approve_pull_request`, `delete_branch` (no write/destructive actions).
+
+This layer wraps MCP client calls (standard MCP protocol via `mcp` Python SDK) to the dormakaba AI Platform MCP server.
 
 #### 4. Tech Stack Auto-Detection
 
@@ -204,17 +204,17 @@ After all sub-agents complete:
 
 **File:** `agent/review/output.py`
 
-Format findings into Bitbucket-compatible markdown:
-- **Summary comment:** Table format per the skill spec (CommonMark, no HTML, no checkboxes)
-- **Inline comments:** One per Critical/Major finding with `// current` and `// suggested` code blocks
+Format findings into a **single summary comment** in Bitbucket-compatible markdown:
+- Table format per the skill spec (CommonMark, no HTML, no checkboxes)
+- Each Critical/Major finding includes `// current` and `// suggested` code blocks inline in the summary
 - **Verdict:** APPROVE / APPROVE WITH COMMENTS / REQUEST CHANGES
+- **No inline comments** on the diff (avoids cluttering the PR)
 
 **File:** `agent/review/poster.py`
 
 Post to Bitbucket via MCP:
-1. Post inline comments first (one per finding)
-2. Post summary comment last (references inline findings by ID)
-3. Handle errors gracefully (if inline comment fails, include in summary)
+1. Post single summary comment via `add_comment`
+2. Handle errors gracefully (retry once, then log)
 
 #### 9. LLM Configuration
 
@@ -252,8 +252,8 @@ agent/
 
 ### Dependencies to Add
 
-- No new major dependencies for POC (uses existing FastAPI, LangChain, LangGraph)
-- MCP client library if not already available (or raw HTTP calls to MCP endpoint)
+- `mcp` — MCP Python SDK (standard MCP client for connecting to AI Platform MCP server)
+- No other new major dependencies (uses existing FastAPI, LangChain, LangGraph)
 
 ### Configuration / Environment Variables
 
@@ -271,14 +271,19 @@ New env vars:
 - Configure Bitbucket DC webhook to point to this URL
 - Env vars in Azure App Service Configuration
 
-### Open Questions / Decisions Needed
+### Resolved Decisions
 
-1. **MCP Protocol:** What's the exact MCP endpoint contract for the AI Platform? Do we call it as HTTP, or is there an SDK?
-2. **Bitbucket webhook plugin:** Does the Bitbucket DC instance have `pr:comment:added` webhook event available natively, or do we need a plugin?
-3. **Rate limits:** Any rate limits on the Bitbucket API or MCP endpoint we should respect?
-4. **File content fetching:** For the no-sandbox POC, how many surrounding files should we fetch for context? (Suggest: changed files + their direct imports, up to ~50 files)
-5. **Review trigger:** Should `@dkai` in the PR *description* (not just comments) also trigger a review?
-6. **Re-review:** If someone comments `@dkai` again on the same PR (after new commits), should it do a fresh full review or incremental?
+1. **MCP Protocol:** Standard MCP protocol — agent connects as MCP client to dormakaba AI Platform MCP server using `mcp` Python SDK.
+2. **Review trigger:** `@dkai` in PR **comments only** (not PR description).
+3. **Re-review:** Full review every time `@dkai` is mentioned (no incremental logic).
+4. **Output:** Single summary comment only — no inline comments on the diff (avoid PR clutter).
+
+### Open Questions
+
+1. **Bitbucket webhook plugin:** Does the Bitbucket DC instance have `pr:comment:added` webhook event available natively, or do we need a plugin?
+2. **Rate limits:** Any rate limits on the Bitbucket API or MCP endpoint we should respect?
+3. **File content fetching:** For the no-sandbox POC, how many surrounding files should we fetch for context? (Suggest: changed files + their direct imports, up to ~50 files)
+4. **Jira access:** Should we add read-only Jira MCP tool so the agent can read the linked ticket for intent context?
 
 ---
 
