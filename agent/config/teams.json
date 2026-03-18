@@ -1,0 +1,41 @@
+{
+  "defaults": {
+    "bitbucket_host": "bitbucket.dormakaba.net",
+    "llm_provider": "anthropic",
+    "llm_model": "claude-sonnet-4-6",
+    "mcp_endpoint": "https://dk-ai-platform-apim.azure-api.net/mcp",
+    "review_config": {
+      "max_diff_lines": 5000,
+      "min_agents": 2,
+      "max_agents": 6,
+      "excluded_paths": [
+        "*.lock",
+        "*.min.js",
+        "*.min.css",
+        "package-lock.json",
+        "yarn.lock",
+        "pnpm-lock.yaml"
+      ],
+      "custom_instructions": ""
+    }
+  },
+  "teams": [
+    {
+      "id": "example-team",
+      "name": "Example Team",
+      "bitbucket_projects": ["PROJ"],
+      "bitbucket_repos": ["PROJ/my-repo"],
+      "mcp_token_env": "TEAM_EXAMPLE_MCP_TOKEN",
+      "bitbucket_token_env": "TEAM_EXAMPLE_BB_TOKEN",
+      "llm_provider": "anthropic",
+      "llm_model": "claude-sonnet-4-6",
+      "review_config": {
+        "custom_instructions": "",
+        "excluded_paths": [],
+        "max_diff_lines": 5000,
+        "min_agents": 2,
+        "max_agents": 6
+      }
+    }
+  ]
+}

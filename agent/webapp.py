@@ -1055,6 +1055,54 @@ async def slack_webhook_verify() -> dict[str, str]:
     return {"status": "ok", "message": "Slack webhook endpoint is active"}
 
 
+@app.post("/webhooks/bitbucket")
+async def bitbucket_webhook(request: Request, background_tasks: BackgroundTasks):
+    """Handle Bitbucket Data Center webhook events (pr:comment:added with @dkai mention)."""
+    from .webhooks.bitbucket import (
+        extract_pr_context,
+        process_bitbucket_review,
+        verify_bitbucket_signature,
+    )
+
+    body = await request.body()
+    signature = request.headers.get("X-Hub-Signature", "")
+
+    if not verify_bitbucket_signature(body, signature):
+        logger.warning("Bitbucket webhook signature verification failed")
+        raise HTTPException(status_code=401, detail="Invalid signature")
+
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    event_key = request.headers.get("X-Event-Key", "")
+    if event_key != "pr:comment:added":
+        logger.debug("Ignoring Bitbucket event: %s", event_key)
+        return {"status": "ignored", "reason": f"Unsupported event: {event_key}"}
+
+    pr_context = extract_pr_context(payload)
+    if not pr_context:
+        logger.debug("No @dkai mention found in Bitbucket comment")
+        return {"status": "ignored", "reason": "No @dkai mention"}
+
+    logger.info(
+        "Bitbucket review requested for %s/%s PR #%d",
+        pr_context["project_key"],
+        pr_context["repo_slug"],
+        pr_context["pr_id"],
+    )
+
+    background_tasks.add_task(process_bitbucket_review, pr_context)
+    return {"status": "accepted"}
+
+
+@app.get("/webhooks/bitbucket")
+async def bitbucket_webhook_verify() -> dict[str, str]:
+    """Verify endpoint for Bitbucket webhook setup."""
+    return {"status": "ok", "message": "Bitbucket webhook endpoint is active"}
+
+
 @app.get("/health")
 async def health_check() -> dict[str, str]:
     """Health check endpoint."""

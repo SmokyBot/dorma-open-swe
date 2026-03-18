@@ -32,8 +32,9 @@ from .middleware import (
     ensure_no_empty_msg,
     open_pr_if_needed,
 )
-from .prompt import construct_system_prompt
+from .prompt import construct_review_system_prompt, construct_system_prompt
 from .tools import (
+    bitbucket_comment,
     commit_and_open_pr,
     fetch_url,
     github_comment,
@@ -51,7 +52,7 @@ SANDBOX_CREATING = "__creating__"
 SANDBOX_CREATION_TIMEOUT = 180
 SANDBOX_POLL_INTERVAL = 1.0
 
-from .utils.agents_md import read_agents_md_in_sandbox
+from .utils.agents_md import read_agents_md_in_sandbox, read_claude_md_in_sandbox
 from .utils.github import (
     _CRED_FILE_PATH,
     cleanup_git_credentials,
@@ -172,6 +173,88 @@ async def _clone_or_pull_repo_in_sandbox(  # noqa: PLR0915
     return repo_dir
 
 
+async def _clone_bitbucket_repo_in_sandbox(
+    sandbox_backend: SandboxBackendProtocol,
+    bitbucket_host: str,
+    project_key: str,
+    repo_slug: str,
+    bitbucket_token: str,
+    source_branch: str | None = None,
+) -> str:
+    """Clone a Bitbucket DC repo into the sandbox and checkout the source branch.
+
+    Uses Bitbucket DC URL format: https://{host}/scm/{project_key}/{repo_slug}.git
+    Credential handling follows the same pattern as _clone_or_pull_repo_in_sandbox.
+    """
+    logger.info(
+        "_clone_bitbucket_repo_in_sandbox called for %s/%s on %s",
+        project_key,
+        repo_slug,
+        bitbucket_host,
+    )
+    loop = asyncio.get_event_loop()
+
+    work_dir = await aresolve_sandbox_work_dir(sandbox_backend)
+    repo_dir = await aresolve_repo_dir(sandbox_backend, repo_slug)
+    clean_url = f"https://{bitbucket_host}/scm/{project_key}/{repo_slug}.git"
+    cred_helper_arg = f"-c credential.helper='store --file={_CRED_FILE_PATH}'"
+    safe_repo_dir = shlex.quote(repo_dir)
+    safe_clean_url = shlex.quote(clean_url)
+
+    logger.info("Resolved sandbox work dir to %s", work_dir)
+
+    is_git_repo = await loop.run_in_executor(None, is_valid_git_repo, sandbox_backend, repo_dir)
+    if is_git_repo:
+        await loop.run_in_executor(None, remove_directory, sandbox_backend, repo_dir)
+        logger.info("Removed existing repo directory for fresh clone")
+
+    cred_line = f"https://git:{bitbucket_token}@{bitbucket_host}\n"
+    await loop.run_in_executor(
+        None, sandbox_backend.write, _CRED_FILE_PATH, cred_line
+    )
+    await loop.run_in_executor(
+        None, sandbox_backend.execute, f"chmod 600 {_CRED_FILE_PATH}"
+    )
+
+    try:
+        logger.info("Cloning Bitbucket repo %s/%s to %s", project_key, repo_slug, repo_dir)
+        result = await loop.run_in_executor(
+            None,
+            sandbox_backend.execute,
+            f"git {cred_helper_arg} clone {safe_clean_url} {safe_repo_dir}",
+        )
+    except Exception:
+        logger.exception("Failed to clone Bitbucket repo")
+        raise
+    finally:
+        await loop.run_in_executor(None, cleanup_git_credentials, sandbox_backend)
+
+    if result.exit_code != 0:
+        msg = f"Failed to clone Bitbucket repo {project_key}/{repo_slug}: {result.output}"
+        logger.error(msg)
+        raise RuntimeError(msg)
+
+    logger.info("Bitbucket repo cloned successfully at %s", repo_dir)
+
+    if source_branch:
+        safe_branch = shlex.quote(source_branch)
+        checkout_result = await loop.run_in_executor(
+            None,
+            sandbox_backend.execute,
+            f"cd {safe_repo_dir} && git checkout {safe_branch}",
+        )
+        if checkout_result.exit_code != 0:
+            logger.warning(
+                "Failed to checkout source branch %s: %s",
+                source_branch,
+                checkout_result.output[:200] if checkout_result.output else "",
+            )
+        else:
+            logger.info("Checked out source branch %s", source_branch)
+
+    return repo_dir
+
+
 async def _recreate_sandbox(
     thread_id: str,
     repo_owner: str,
@@ -251,6 +334,13 @@ async def get_agent(config: RunnableConfig) -> Pregel:  # noqa: PLR0915
             tools=[],
         ).with_config(config)
 
+    source = config["configurable"].get("source", "")
+
+    # ── Bitbucket review agent branch ──────────────────────────────────
+    if source == "bitbucket":
+        return await _get_bitbucket_review_agent(config, thread_id, repo_owner, repo_name)
+
+    # ── Default branch (Linear / Slack / GitHub) ──────────────────────
     github_token, new_encrypted = await resolve_github_token(config, thread_id)
     config["metadata"]["github_token_encrypted"] = new_encrypted
 
@@ -390,5 +480,129 @@ async def get_agent(config: RunnableConfig) -> Pregel:  # noqa: PLR0915
             check_message_queue_before_model,
             ensure_no_empty_msg,
             open_pr_if_needed,
+        ],
+    ).with_config(config)
+
+
+async def _get_bitbucket_review_agent(
+    config: RunnableConfig,
+    thread_id: str,
+    repo_owner: str | None,
+    repo_name: str | None,
+) -> Pregel:
+    """Create a review-focused Deep Agent for Bitbucket PR reviews.
+
+    This branch handles source=="bitbucket" in get_agent(). It:
+    1. Resolves the Bitbucket token from config (system-level, agent never sees it)
+    2. Creates a sandbox and clones the repo using Bitbucket DC URL format
+    3. Checks out the PR source branch
+    4. Reads AGENTS.md and CLAUDE.md from the repo
+    5. Builds a review-focused system prompt
+    6. Returns create_deep_agent() with review-specific tools (no commit_and_open_pr)
+    """
+    configurable = config["configurable"]
+    bb_pr = configurable.get("bitbucket_pr", {})
+
+    project_key = bb_pr.get("project_key", repo_owner or "")
+    repo_slug = bb_pr.get("repo_slug", repo_name or "")
+    pr_id = bb_pr.get("pr_id", 0)
+    source_branch = bb_pr.get("source_branch", "")
+    target_branch = bb_pr.get("target_branch", "main")
+    pr_title = bb_pr.get("pr_title", "")
+    author_name = bb_pr.get("author_name", "")
+    comment_text = bb_pr.get("comment_text", "")
+
+    bitbucket_host = configurable.get("bitbucket_host", "bitbucket.dormakaba.net")
+    bitbucket_token = configurable.get("bitbucket_token", "")
+    llm_provider = configurable.get("llm_provider", "anthropic")
+    llm_model = configurable.get("llm_model", "claude-sonnet-4-6")
+
+    if not bitbucket_token:
+        msg = "No Bitbucket token in config for review agent"
+        raise ValueError(msg)
+
+    logger.info(
+        "Creating Bitbucket review agent for %s/%s PR #%d, thread %s",
+        project_key,
+        repo_slug,
+        pr_id,
+        thread_id,
+    )
+
+    # Create sandbox
+    await client.threads.update(thread_id=thread_id, metadata={"sandbox_id": SANDBOX_CREATING})
+    try:
+        sandbox_backend = await asyncio.to_thread(create_sandbox)
+        logger.info("Sandbox created for Bitbucket review: %s", sandbox_backend.id)
+
+        repo_dir = await _clone_bitbucket_repo_in_sandbox(
+            sandbox_backend,
+            bitbucket_host,
+            project_key,
+            repo_slug,
+            bitbucket_token,
+            source_branch=source_branch,
+        )
+        logger.info("Bitbucket repo cloned to %s", repo_dir)
+
+        await client.threads.update(
+            thread_id=thread_id,
+            metadata={"repo_dir": repo_dir},
+        )
+    except Exception:
+        logger.exception("Failed to create sandbox or clone Bitbucket repo")
+        try:
+            await client.threads.update(thread_id=thread_id, metadata={"sandbox_id": None})
+        except Exception:
+            logger.exception("Failed to reset sandbox_id metadata")
+        raise
+
+    SANDBOX_BACKENDS[thread_id] = sandbox_backend
+
+    # Read repo-specific instructions
+    agents_md = await read_agents_md_in_sandbox(sandbox_backend, repo_dir)
+    claude_md = await read_claude_md_in_sandbox(sandbox_backend, repo_dir)
+
+    # Resolve review config
+    from .config.loader import resolve_team_config
+
+    team_config = resolve_team_config(project_key, repo_slug)
+    review_config = team_config.review_config
+
+    # Build review system prompt
+    system_prompt = construct_review_system_prompt(
+        repo_dir,
+        pr_title=pr_title,
+        pr_id=pr_id,
+        source_branch=source_branch,
+        target_branch=target_branch,
+        author=author_name,
+        comment_text=comment_text,
+        project_key=project_key,
+        repo_slug=repo_slug,
+        min_agents=review_config.min_agents,
+        max_agents=review_config.max_agents,
+        custom_instructions=review_config.custom_instructions,
+        agents_md=agents_md or "",
+        claude_md=claude_md or "",
+    )
+
+    # Model from team config
+    model_id = f"{llm_provider}:{llm_model}"
+
+    logger.info("Returning Bitbucket review agent for thread %s (model: %s)", thread_id, model_id)
+    return create_deep_agent(
+        model=make_model(model_id, temperature=0, max_tokens=20_000),
+        system_prompt=system_prompt,
+        tools=[
+            http_request,
+            fetch_url,
+            bitbucket_comment,
+        ],
+        backend=sandbox_backend,
+        middleware=[
+            ToolErrorMiddleware(),
+            check_message_queue_before_model,
+            ensure_no_empty_msg,
         ],
     ).with_config(config)
