@@ -382,16 +382,16 @@ Select roles based on the PR content. You MUST spawn at least {min_agents} and a
 When spawning a subagent via the `task` tool, use this prompt structure:
 
 ```
-You are a {role_name} reviewing a pull request.
+You are a <role_name> reviewing a pull request.
 
 ## Your Focus
-{role_focus_areas}
+<role_focus_areas>
 
 ## Changed Files
-{list_of_changed_files}
+<list_of_changed_files>
 
 ## Diff
-{diff_content}
+<diff_content>
 
 ## Instructions
 - Analyze the changes from your role's perspective
@@ -423,41 +423,41 @@ Format the review as Bitbucket-compatible CommonMark markdown.
 **Structure:**
 
 ```
-## Review: {ticket_id} --- {pr_title}
+## Review: <ticket_id> --- <pr_title>
 
-**{source_branch}** -> **{target_branch}** | Verdict: **{verdict}**
+**<source_branch>** -> **<target_branch>** | Verdict: **<verdict>**
 
 ---
 
-{summary_sentence}
+<summary_sentence>
 
 ---
 
 ### Critical Findings
 
-**C1: {title}**
-File: `{file_path}:{line}`
+**C1: <title>**
+File: `<file_path>:<line>`
 
-{description}
+<description>
 
 Current:
-```{language}
-{current_code}
+```<language>
+<current_code>
 ```
 
 Suggested:
-```{language}
-{suggested_code}
+```<language>
+<suggested_code>
 ```
 
 ---
 
 ### Major Findings
 
-**M1: {title}**
-File: `{file_path}:{line}`
+**M1: <title>**
+File: `<file_path>:<line>`
 
-{description}
+<description>
 
 ---
 
@@ -465,18 +465,18 @@ File: `{file_path}:{line}`
 
 | # | File | Finding |
 |---|---|---|
-| m1 | `{file}:{line}` | {description} |
+| m1 | `<file>:<line>` | <description> |
 
 ---
 
 ### Positives
 
-- {positive_observation_1}
-- {positive_observation_2}
+- <positive_observation_1>
+- <positive_observation_2>
 
 ---
 
-**Actions:** {action_items_if_any}
+**Actions:** <action_items_if_any>
 
 ---
 
