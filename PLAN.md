@@ -96,7 +96,7 @@ Bitbucket DC PR Comment ("@dkai please review")
 │  2. Create sandbox                 │
 │  3. Clone repo via HTTPS           │
 │  4. Remove credentials from sandbox│
-│  5. Read AGENTS.md                 │
+│  5. Read AGENTS.md + CLAUDE.md     │ ◄── repo-specific instructions
 │  6. Build review system prompt     │
 │  7. Return create_deep_agent()     │
 │     with Bitbucket tools           │
@@ -182,7 +182,21 @@ The following existing modules contain useful logic that should inform the **sys
 - `agent/review/role_selector.py` — Role catalog and selection logic. Encode the role descriptions and relevance criteria directly in the system prompt.
 - `agent/review/output.py` — Comment formatting rules (Bitbucket-compatible markdown). Encode the output format in the system prompt.
 
-### 7. Checkout Source Branch in Sandbox
+### 7. Respect AGENTS.md and CLAUDE.md from the Reviewed Repository
+
+The framework already reads `AGENTS.md` from the cloned repo and injects it into the system prompt (see `agent/utils/agents_md.py` and `agent/server.py:368`). Extend this to also read `CLAUDE.md` — both are standard convention files that repositories use to provide project-specific instructions to AI agents.
+
+These files may contain:
+- Coding conventions and style rules
+- Architecture constraints ("never modify X", "always use Y pattern")
+- Test requirements ("run `make test` before submitting")
+- Review-specific guidance ("pay special attention to SQL injection in the data layer")
+
+The review agent must follow these instructions just like a human reviewer would follow a team's review guidelines. Both files are injected into the system prompt via `<agents_md>` / `<claude_md>` tags so the agent treats them as authoritative project context.
+
+The `read_agents_md_in_sandbox()` utility should be extended (or a parallel `read_claude_md_in_sandbox()` added) to also look for `CLAUDE.md`. Both are passed to `construct_review_system_prompt()`.
+
+### 8. Checkout Source Branch in Sandbox
 
 After cloning, the agent should checkout the PR's source branch to review the actual code:
 ```
