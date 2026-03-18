@@ -1465,3 +1465,22 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks) ->
 
     logger.info("Ignoring unsupported GitHub payload shape for event=%s", event_type)
     return {"status": "ignored", "reason": f"Unsupported payload for event type: {event_type}"}
+
+
+# ── Bitbucket DC webhook ─────────────────────────────────────────────
+
+
+@app.post("/webhooks/bitbucket")
+async def bitbucket_webhook(
+    request: Request, background_tasks: BackgroundTasks
+) -> dict[str, str]:
+    """Handle Bitbucket DC webhooks for PR comment events with @dkai mentions."""
+    from .webhooks.bitbucket import handle_bitbucket_webhook
+
+    return await handle_bitbucket_webhook(request, background_tasks)
+
+
+@app.get("/webhooks/bitbucket")
+async def bitbucket_webhook_verify() -> dict[str, str]:
+    """Verify endpoint for Bitbucket DC webhook setup."""
+    return {"status": "ok", "service": "dkai-code-review"}
