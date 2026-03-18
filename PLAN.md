@@ -1,297 +1,477 @@
-# DK AI Code Review Agent — Roadmap & POC Plan
+# DK AI Code Review Agent — Implementation Plan
 
 ## Summary
 
-Extend the Open SWE Agent framework to support **Bitbucket Data Center** code reviews, triggered by `@dkai` mentions in PR comments. The agent reads the PR diff via dormakaba AI Platform MCP tools, spawns multiple independent review sub-agents with auto-detected roles, validates findings, and posts results back as Bitbucket inline + summary comments.
+Extend the Open SWE Agent framework to support **Bitbucket Data Center** code reviews, triggered by `@dkai` mentions in PR comments. Following the framework's customization patterns (`CUSTOMIZATION.md`), the agent runs in a sandbox with a cloned repo, uses the Deep Agent architecture with subagents for parallel review, and posts results via MCP tools.
 
 ---
 
-## High-Level Roadmap (Long-Term)
+## Roadmap
 
-### Phase 1 — POC: Comment-Only Review via @dkai (THIS PLAN)
-- Bitbucket DC webhook handler for PR comment events
-- `@dkai` mention detection
-- MCP-based Bitbucket access (read diff, file contents, post comments)
-- Multi-agent review with auto-detected roles (no sandbox, no git clone)
-- Claude (Anthropic API) as LLM backend
-- JSON config file for team settings
+### Phase 1 — POC: Full Framework-Aligned Review Agent (THIS PLAN)
+- Bitbucket DC webhook → LangGraph run (same pattern as Slack/Linear triggers)
+- Full sandbox: clone repo via HTTPS + per-repo access token (system-managed)
+- Deep Agent with review-focused system prompt and Bitbucket/Jira tools
+- Subagents via `task` tool for parallel multi-role review
+- MCP for Bitbucket write operations (add_comment)
 - Deploy to Azure
 
-### Phase 2 — Sandbox + Deep Code Analysis
-- Add sandbox support (clone repo, full codebase exploration)
-- Git checkout of source branch for surrounding code context
-- Enhanced review depth (cross-file analysis, dependency graphs)
-- AGENTS.md support for repo-specific review rules
+### Phase 2 — Auto-Review on PR Creation
+- Webhook for `pr:opened` events (auto-review without `@dkai`)
+- Configurable per-team opt-in
 
-### Phase 3 — Auto-Review on PR Creation
-- Webhook for `pr:opened` events (automatic review without @dkai mention)
-- Configurable per-team: opt-in auto-review vs. mention-only
-- Review scope filters (file patterns, diff size thresholds)
+### Phase 3 — Review + Auto-Fix
+- Agent pushes fix commits via system-managed `commit_and_open_bb_pr` tool
+- `@dkai fix C1` to auto-fix specific findings
 
-### Phase 4 — Review + Auto-Fix
-- Agent can push fix commits to the PR branch
-- "Fix on request" mode: `@dkai fix C1` to auto-fix a specific finding
-- Lint/format auto-fixes
-
-### Phase 5 — Multi-LLM + AI Experience Hub Integration
-- Azure OpenAI (Codex Mini, GPT-4o) as alternative backend
-- Pluggable LLM per team via config
-- DB/API config backend (replace JSON) managed from AI Experience Hub
+### Phase 4 — Multi-LLM + AI Experience Hub
+- Azure OpenAI as alternative backend
+- DB/API config backend (replace JSON)
 - Team self-service configuration UI
 
-### Phase 6 — Multi-Provider
-- GitLab support
-- Azure DevOps support
-- Unified provider abstraction layer
+### Phase 5 — Multi-Provider
+- GitLab, Azure DevOps support
 
 ---
 
-## POC Detailed Plan
+## Architecture
 
-### Architecture Overview
+### Access Control Model
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  Bitbucket DC                                               │
-│  PR Comment: "@dkai please review"                          │
-└──────────────────────────┬──────────────────────────────────┘
-                           │ Webhook (pr:comment:added)
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│  FastAPI Webhook Handler (new: /webhooks/bitbucket)         │
-│  ─────────────────────────────────────────────────────────  │
-│  1. Verify webhook signature (HMAC)                         │
-│  2. Detect @dkai mention in comment text                    │
-│  3. Extract: project, repo, PR number, comment author       │
-│  4. Look up team config from JSON                           │
-│  5. Create LangGraph run                                    │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│  Review Orchestrator (new graph node / agent)               │
-│  ─────────────────────────────────────────────────────────  │
-│  1. Fetch PR metadata + diff via MCP                        │
-│  2. Auto-detect tech stack from changed files               │
-│  3. Read linked Jira ticket via MCP (if available)          │
-│  4. Select 2-6 review roles based on changes + tech stack   │
-│  5. Spawn independent review sub-agents (parallel)          │
-│     Each agent gets MCP tools to freely explore the repo    │
-│     (get_file_content, browse_repository, get_diff)         │
-│  6. Collect findings, deduplicate, validate                 │
-│  7. Post single summary comment (table format, no inlines)  │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│  SYSTEM LEVEL (agent never sees these credentials)      │
+│  ─────────────────────────────────────────────────────  │
+│  • Per-repo HTTPS access token (from team config)       │
+│  • System clones repo into sandbox at startup           │
+│  • Credentials written via sandbox_backend.write() —    │
+│    never in shell history                               │
+│  • Credentials removed after clone (cleanup_git_creds)  │
+│  • Future: system-managed PR creation (Phase 3)         │
+└─────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────┐
+│  AGENT LEVEL (what the agent has access to)             │
+│  ─────────────────────────────────────────────────────  │
+│  • Local file access in sandbox (read, grep, execute)   │
+│  • MCP bearer token for AI Platform gateway             │
+│    → Controls WHICH tools agent can call                │
+│    → POC: add_comment, get_file_content,                │
+│      browse_repository, get_diff, get_pull_request,     │
+│      get_comments, get_issue (Jira)                     │
+│  • NO git push credentials                              │
+│  • NO direct Bitbucket REST API access                  │
+└─────────────────────────────────────────────────────────┘
 ```
 
-### Components to Build
+### Request Flow
 
-#### 1. Team Configuration (JSON)
+```
+Bitbucket DC PR Comment (@dkai)
+        │
+        ▼  Webhook (pr:comment:added)
+┌────────────────────────────────────┐
+│  POST /webhooks/bitbucket          │
+│  (agent/webhooks/bitbucket.py)     │
+│  1. Verify HMAC signature          │
+│  2. Detect @dkai mention           │
+│  3. Extract PR context             │
+│  4. Resolve team config            │
+│  5. langgraph_client.runs.create() │ ◄── KEY: creates LangGraph run
+└────────────┬───────────────────────┘
+             │
+             ▼
+┌────────────────────────────────────┐
+│  get_agent(config)                 │
+│  (agent/server.py)                 │
+│  source == "bitbucket" branch:     │
+│  1. resolve_bitbucket_token()      │ ◄── system-level credential
+│  2. Create sandbox                 │
+│  3. Clone repo via HTTPS           │
+│  4. Cleanup credentials            │
+│  5. Read AGENTS.md from sandbox    │
+│  6. Build review system prompt     │
+│  7. create_deep_agent() with       │
+│     Bitbucket tools + MCP tools    │
+└────────────┬───────────────────────┘
+             │
+             ▼
+┌────────────────────────────────────┐
+│  Deep Agent (review mode)          │
+│  System prompt instructs:          │
+│  1. Fetch PR metadata + diff       │
+│     (MCP or local files)           │
+│  2. Auto-detect tech stack         │
+│     (local files in sandbox)       │
+│  3. Fetch Jira ticket (MCP)        │
+│  4. Select 2-6 review roles        │
+│  5. Spawn subagents via `task`     │ ◄── framework's built-in tool
+│     Each subagent:                 │
+│     - Gets role-specific prompt    │
+│     - Has sandbox access (grep,    │
+│       read_file, execute)          │
+│     - Can explore codebase deeply  │
+│  6. Collect + validate findings    │
+│  7. Format summary comment         │
+│  8. Post via bitbucket_comment     │ ◄── MCP-backed tool
+└────────────────────────────────────┘
+```
+
+---
+
+## Implementation Details
+
+### 1. Webhook Handler (REWRITE)
+
+**File:** `agent/webhooks/bitbucket.py`
+
+Current state: Calls `run_review()` directly in background task.
+Required: Must create LangGraph runs like Slack/Linear handlers do.
+
+```python
+async def process_bitbucket_review(pr_context: dict, team_config: TeamConfig):
+    thread_id = f"bitbucket:{project_key}:{repo_slug}:{pr_id}"
+    langgraph_client = get_client(url=LANGGRAPH_URL)
+
+    prompt = _build_review_prompt(pr_context)
+
+    await langgraph_client.runs.create(
+        thread_id,
+        "agent",
+        input={"messages": [{"role": "user", "content": prompt}]},
+        config={"configurable": {
+            "repo": {
+                "owner": project_key,     # maps to Bitbucket project
+                "name": repo_slug,        # maps to Bitbucket repo
+            },
+            "source": "bitbucket",
+            "bitbucket_pr": pr_context,   # PR metadata for tools/prompt
+            "team_config_id": team_config.name,
+            "mcp_token": team_config.mcp_token,  # encrypted in transit
+        }},
+        if_not_exists="create",
+    )
+```
+
+### 2. Server Integration (ADAPT `get_agent()`)
+
+**File:** `agent/server.py`
+
+Following CUSTOMIZATION.md section 4 (Adding a new trigger), add a `source == "bitbucket"` branch in `get_agent()`:
+
+```python
+async def get_agent(config: RunnableConfig) -> Pregel:
+    source = config["configurable"].get("source")
+
+    if source == "bitbucket":
+        return await _get_bitbucket_review_agent(config)
+
+    # ... existing GitHub/Linear/Slack flow ...
+```
+
+The `_get_bitbucket_review_agent()` function:
+1. Resolves Bitbucket HTTPS access token from team config (system-level)
+2. Creates sandbox (same factory as existing — `SANDBOX_TYPE` env var)
+3. Clones repo via `_clone_or_pull_repo_in_sandbox()` (adapted for Bitbucket DC URL format: `https://{bitbucket_host}/scm/{project}/{repo}.git`)
+4. Cleans up git credentials after clone
+5. Reads AGENTS.md from sandbox
+6. Constructs review-focused system prompt
+7. Returns `create_deep_agent()` with Bitbucket-specific tools
+
+```python
+return create_deep_agent(
+    model=make_model(team_config.llm_model, temperature=0, max_tokens=16_000),
+    system_prompt=construct_review_system_prompt(repo_dir, pr_context, agents_md),
+    tools=[
+        bitbucket_comment,       # Post review via MCP add_comment
+        fetch_url,               # Web research (best practices lookup)
+        http_request,            # General HTTP
+    ],
+    backend=sandbox_backend,
+    middleware=[
+        ToolErrorMiddleware(),
+        check_message_queue_before_model,
+        ensure_no_empty_msg,
+        # NO open_pr_if_needed — review agent doesn't create PRs
+    ],
+).with_config(config)
+```
+
+Note: The agent also gets Deep Agent built-in tools (read_file, write_file, execute, grep, glob, task, todo) from the sandbox backend — these are not listed in `tools=[]` but are always available.
+
+### 3. Clone URL Adaptation
+
+**File:** `agent/server.py` (in `_clone_or_pull_repo_in_sandbox`)
+
+The framework constructs: `https://github.com/{owner}/{repo}.git`
+For Bitbucket DC: `https://{BITBUCKET_HOST}/scm/{project_key}/{repo_slug}.git`
+
+We adapt the URL construction based on source:
+
+```python
+if source == "bitbucket":
+    bitbucket_host = os.environ.get("BITBUCKET_HOST", "bitbucket.dormakaba.net")
+    clean_url = f"https://{bitbucket_host}/scm/{owner}/{repo}.git"
+else:
+    clean_url = f"https://github.com/{owner}/{repo}.git"
+```
+
+Credential flow stays identical:
+1. `setup_git_credentials(sandbox_backend, token)` — writes to `/tmp/.git-credentials`
+2. `git clone` with credential helper
+3. `cleanup_git_credentials(sandbox_backend)` — removes file
+
+### 4. Auth Resolution (NEW)
+
+**File:** `agent/utils/bitbucket_auth.py`
+
+Replaces `resolve_github_token()` for Bitbucket source:
+
+```python
+async def resolve_bitbucket_token(config: RunnableConfig, thread_id: str) -> tuple[str, str]:
+    """Resolve a Bitbucket HTTPS access token from team config.
+
+    For Bitbucket, tokens come from per-repo access tokens stored as env vars
+    in the team config (e.g., TEAM_ALPHA_BB_TOKEN), not from OAuth.
+    """
+    team_config_id = config["configurable"].get("team_config_id")
+    team_config = load_team_config_by_id(team_config_id)
+
+    # Token stored as env var name in team config
+    token_env = team_config.get("bitbucket_token_env", "")
+    token = os.environ.get(token_env, "")
+
+    if not token:
+        # Fallback to default
+        token = os.environ.get("DK_BITBUCKET_TOKEN", "")
+
+    if not token:
+        raise RuntimeError(f"No Bitbucket token for team {team_config_id}")
+
+    encrypted = encrypt_token(token)
+    await client.threads.update(thread_id=thread_id, metadata={"bb_token_encrypted": encrypted})
+    return token, encrypted
+```
+
+### 5. Team Configuration (ADAPT)
 
 **File:** `agent/config/teams.json`
 
+Add `bitbucket_token_env` field:
+
 ```json
 {
+  "defaults": {
+    "llm_provider": "anthropic",
+    "llm_model": "claude-sonnet-4-20250514",
+    "bitbucket_host": "bitbucket.dormakaba.net"
+  },
   "teams": {
     "team-alpha": {
       "name": "Team Alpha",
       "bitbucket_projects": ["WAD", "CORE"],
-      "bitbucket_repos": ["vaude", "trinity-cloud"],
+      "bitbucket_repos": ["WAD/my-repo"],
       "mcp_token_env": "TEAM_ALPHA_MCP_TOKEN",
+      "bitbucket_token_env": "TEAM_ALPHA_BB_TOKEN",
       "llm_provider": "anthropic",
       "llm_model": "claude-sonnet-4-20250514",
       "review_config": {
-        "auto_review_on_pr_create": false,
-        "max_diff_lines": 5000,
         "custom_review_instructions": "Focus on Spring Boot best practices",
-        "excluded_paths": ["**/generated/**", "**/test/fixtures/**"]
+        "excluded_paths": ["**/generated/**"],
+        "max_diff_lines": 5000,
+        "min_review_agents": 2,
+        "max_review_agents": 6
       }
     }
   }
 }
 ```
 
-**File:** `agent/config/loader.py` — Config loader with env var interpolation and validation.
+### 6. Bitbucket Comment Tool (NEW)
 
-#### 2. Bitbucket Webhook Handler
+**File:** `agent/tools/bitbucket_comment.py`
 
-**File:** `agent/webhooks/bitbucket.py`
+Replaces `github_comment`. Uses MCP via the `BitbucketMCPClient`:
 
-New FastAPI route `POST /webhooks/bitbucket`:
-- Verify webhook signature (Bitbucket DC uses HMAC-SHA256 on `X-Hub-Signature` header)
-- Parse event type from `X-Event-Key` header (`pr:comment:added`)
-- Extract PR details: project key, repo slug, PR ID, comment body, author
-- Check for `@dkai` mention (case-insensitive)
-- Resolve team from project/repo mapping in config
-- Generate thread ID: `bitbucket:{project}:{repo}:{pr_id}`
-- Acknowledge with reaction/reply (if Bitbucket API supports it)
-- Create LangGraph run with PR context
+```python
+def bitbucket_comment(text: str) -> dict:
+    """Post a comment on the current Bitbucket pull request.
 
-Register in `agent/webapp.py` alongside existing webhook routes.
+    Use this to post your review summary after completing the code review.
 
-#### 3. Bitbucket MCP Integration Layer
+    Args:
+        text: The comment text in markdown format.
+
+    Returns:
+        Dictionary with success status and any error.
+    """
+    config = get_config()
+    configurable = config.get("configurable", {})
+    pr_context = configurable.get("bitbucket_pr", {})
+    mcp_token = configurable.get("mcp_token", "")
+
+    # Uses BitbucketMCPClient to call add_comment via MCP
+    result = asyncio.run(_post_comment(mcp_token, pr_context, text))
+    return result
+```
+
+### 7. Review System Prompt (NEW)
+
+**File:** `agent/prompt.py` — add `REVIEW_SYSTEM_PROMPT_SECTION`
+
+Following CUSTOMIZATION.md section 5, add a new prompt section for reviews:
+
+```python
+REVIEW_SYSTEM_PROMPT_SECTION = """---
+
+### Review Task
+
+You are performing a code review on a Bitbucket Pull Request.
+
+**PR Context:**
+- Project: {project_key}/{repo_slug}
+- PR #{pr_id}: {pr_title}
+- Branch: {source_branch} → {target_branch}
+- Author: {pr_author}
+{jira_context}
+
+**Your workflow:**
+1. Fetch the PR diff (use `execute` to run `git diff {target_branch}...{source_branch}` in your local repo)
+2. Explore the local codebase in your sandbox for deeper context (grep, read files, understand architecture)
+3. Detect the tech stack from local files
+4. Use the `task` tool to spawn 2-6 review subagents in parallel, each with a specialized role
+5. Collect findings from all subagents
+6. Validate, deduplicate, and format findings
+7. Post a single summary comment using the `bitbucket_comment` tool
+
+**Review roles to consider:** Architecture Guardian (always), Security Auditor, Performance Analyst, Test Strategist, Error Handling Engineer, Backend Framework Expert, Database Specialist, API Reviewer, Frontend Expert, Code Quality Analyst — select based on tech stack and change type.
+
+**Output format:** Use the standard review comment format (CommonMark markdown, no HTML):
+- Header with verdict (APPROVE / APPROVE WITH COMMENTS / REQUEST CHANGES)
+- Critical findings with code blocks (current + suggested)
+- Major findings with code blocks
+- Minor findings in table format
+- Positives section
+- Actions line
+- Signature: *Generated with DK AI Platform (ai-platform.dormakaba.net)*
+
+{custom_review_instructions}
+"""
+```
+
+The `construct_review_system_prompt()` function assembles:
+- `WORKING_ENV_SECTION` (from existing prompt.py)
+- `REVIEW_SYSTEM_PROMPT_SECTION` (new)
+- AGENTS.md content (from repo)
+- Team custom instructions (from config)
+
+### 8. MCP Client (KEEP)
 
 **File:** `agent/utils/bitbucket_mcp.py`
 
-Wrapper around MCP tool calls. Both Bitbucket and Jira tools are served from the **same** dormakaba AI Platform MCP server:
+Keep the existing `BitbucketMCPClient` as-is. It's used by the `bitbucket_comment` tool internally. The agent doesn't need direct MCP access because it has local sandbox access for file exploration.
 
-- **MCP endpoint:** `https://ai-platform.dormakaba.net/api/mcp` (via APIM: `https://dk-ai-platform-apim.azure-api.net/mcp`)
-- **Auth:** Bearer token in `Authorization` header
-- **Protocol:** Standard MCP over HTTP (Streamable HTTP transport)
+For POC, the only MCP write operation is `add_comment`. All code exploration happens locally in the sandbox (grep, read_file, etc.).
 
-**Bitbucket MCP tools (6 enabled):**
-- `get_pull_request` — PR metadata (source/target branch, title, description, author)
-- `get_diff` — Full diff content for the PR
-- `get_file_content` — Fetch any file at specific ref (agents use this freely to explore surrounding code)
-- `browse_repository` — Explore repo directory structure (tech stack detection, project understanding)
-- `add_comment` — Post summary review comment on the PR
-- `get_comments` — Fetch existing PR comments (context on re-review)
+### 9. Utilities (KEEP as utilities)
 
-**Jira MCP tools (read-only):**
-- `get_issue` — Read the linked Jira ticket (summary, description, acceptance criteria, status)
+**Files that stay as utility modules:**
+- `agent/review/tech_detector.py` — Used by system prompt builder or agent can detect locally
+- `agent/review/role_selector.py` — Used by system prompt builder to suggest roles
+- `agent/review/output.py` — Used by `bitbucket_comment` tool or the agent formats it in-prompt
+- `agent/review/validator.py` — Used as post-processing utility
 
-**Not enabled (POC):** `add_comment_inline` (no inline comments to avoid PR clutter), `create_pull_request`, `merge_pull_request`, `decline_pull_request`, `approve_pull_request`, `delete_branch` (no write/destructive actions).
+### 10. Files to DELETE
 
-**Key design:** Review sub-agents get direct access to `get_file_content` and `browse_repository` so they can autonomously explore the codebase as deep as needed — not limited to pre-fetched files.
+These are replaced by the framework's Deep Agent + subagent architecture:
+- `agent/review/orchestrator.py` — Agent handles orchestration via system prompt
+- `agent/review/executor.py` — Subagents run via `task` tool, not direct `init_chat_model().ainvoke()`
+- `agent/review/poster.py` — Replaced by `bitbucket_comment` tool
 
-#### 4. Tech Stack Auto-Detection
-
-**File:** `agent/review/tech_detector.py`
-
-Analyze changed files to detect:
-- **Languages:** Java, TypeScript, Python, Go, etc. (by file extension)
-- **Frameworks:** Spring Boot (pom.xml, @SpringBootApplication), Angular (angular.json, @Component), React (package.json with react), etc.
-- **Build tools:** Maven, Gradle, npm, yarn, etc.
-- **Patterns:** REST APIs, GraphQL, WebSocket, database migrations, CI/CD configs
-
-Returns a `TechProfile` dataclass used by the role selector.
-
-#### 5. Review Role Selector
-
-**File:** `agent/review/role_selector.py`
-
-Given the `TechProfile` + diff summary + team config:
-1. Always include **Architecture & Integration Guardian** (Role #1)
-2. Score remaining roles by relevance to the actual changes
-3. Combine roles for smaller diffs (e.g., "Security + Performance" in one agent)
-4. Split into focused agents for larger diffs
-5. Cap at 2-6 agents total
-6. Respect team config overrides (custom roles, excluded roles)
-
-Returns list of `ReviewAgent` specs with role name, focus areas, and specific instructions.
-
-#### 6. Review Sub-Agent Execution
-
-**File:** `agent/review/executor.py`
-
-For each review agent:
-1. Build a role-specific system prompt with:
-   - Role description and focus areas
-   - The PR diff
-   - Key file contents (for context around changes)
-   - Tech stack info
-   - Team-specific review instructions
-2. Call Claude API (or configured LLM) independently
-3. Parse structured findings (severity, file, line, description, suggestion)
-4. Return findings list
-
-All agents run in **parallel** for speed.
-
-#### 7. Finding Validation & Deduplication
-
-**File:** `agent/review/validator.py`
-
-After all sub-agents complete:
-1. Merge all findings
-2. Deduplicate (same file + line + similar description)
-3. Validate ambiguous findings by:
-   - Cross-referencing with actual file content via MCP
-   - Checking if the "issue" is intentional (e.g., TODO comments, known patterns)
-4. Assign final severity (Critical/Major/Minor)
-5. Sort by severity, then by file
-
-#### 8. Comment Formatter & Poster
-
-**File:** `agent/review/output.py`
-
-Format findings into a **single summary comment** in Bitbucket-compatible markdown:
-- Table format per the skill spec (CommonMark, no HTML, no checkboxes)
-- Each Critical/Major finding includes `// current` and `// suggested` code blocks inline in the summary
-- **Verdict:** APPROVE / APPROVE WITH COMMENTS / REQUEST CHANGES
-- **No inline comments** on the diff (avoids cluttering the PR)
-
-**File:** `agent/review/poster.py`
-
-Post to Bitbucket via MCP:
-1. Post single summary comment via `add_comment`
-2. Handle errors gracefully (retry once, then log)
-
-#### 9. LLM Configuration
-
-**File:** `agent/utils/llm.py` (extend existing `model.py`)
-
-- Default: `anthropic:claude-sonnet-4-20250514` for review agents (fast + capable)
-- Configurable per team in JSON config
-- API key via environment variable (subscription-based Anthropic key)
-- Later: Azure OpenAI support
-
-### File Structure (New Files)
-
-```
-agent/
-├── config/
-│   ├── __init__.py
-│   ├── teams.json              # Team configuration
-│   └── loader.py               # Config loader + validation
-├── webhooks/
-│   ├── __init__.py
-│   └── bitbucket.py            # Bitbucket DC webhook handler
-├── review/
-│   ├── __init__.py
-│   ├── orchestrator.py         # Main review flow coordinator
-│   ├── tech_detector.py        # Auto-detect tech stack
-│   ├── role_selector.py        # Pick review roles
-│   ├── executor.py             # Run review sub-agents
-│   ├── validator.py            # Validate + deduplicate findings
-│   ├── output.py               # Format findings as markdown
-│   └── poster.py               # Post to Bitbucket via MCP
-├── utils/
-│   └── bitbucket_mcp.py        # MCP tool call wrappers
-└── webapp.py                   # (modified) Register /webhooks/bitbucket
-```
-
-### Dependencies to Add
-
-- `mcp` — MCP Python SDK (standard MCP client for connecting to AI Platform MCP server)
-- No other new major dependencies (uses existing FastAPI, LangChain, LangGraph)
-
-### Configuration / Environment Variables
-
-New env vars:
-- `BITBUCKET_WEBHOOK_SECRET` — HMAC secret for webhook verification
-- `ANTHROPIC_API_KEY` — Claude subscription API key
-- `TEAM_CONFIG_PATH` — Path to teams.json (default: `agent/config/teams.json`)
-- `DK_MCP_ENDPOINT` — AI Platform MCP URL (default: `https://dk-ai-platform-apim.azure-api.net/mcp`)
-- `DK_MCP_TOKEN` — Bearer token for AI Platform MCP (or per-team tokens via config)
-
-### Deployment (Azure)
-
-- Azure App Service or Azure Container Instances
-- Docker image based on existing Dockerfile
-- Webhook URL: `https://<app>.azurewebsites.net/webhooks/bitbucket`
-- Configure Bitbucket DC webhook to point to this URL
-- Env vars in Azure App Service Configuration
-
-### Resolved Decisions
-
-1. **MCP Protocol:** Standard MCP protocol — agent connects as MCP client to dormakaba AI Platform MCP server using `mcp` Python SDK.
-2. **Review trigger:** `@dkai` in PR **comments only** (not PR description).
-3. **Re-review:** Full review every time `@dkai` is mentioned (no incremental logic).
-4. **Output:** Single summary comment only — no inline comments on the diff (avoid PR clutter).
-5. **Webhooks:** Bitbucket DC natively supports `Pull request > Comment added` event. No plugin needed.
-6. **Rate limits:** No concerns for POC.
-7. **Context depth:** Agent-driven exploration — review agents get direct MCP tool access to freely explore the repo, not just pre-fetched files. Reviews should assess the full feature context, project structure, and broader impact — not just changed lines.
-8. **Jira:** Yes — add read-only Jira MCP access so agents can read the linked ticket for intent and acceptance criteria.
+Keep the data classes (`Finding`, `AgentResult`) — move them to a shared types module or into `validator.py`.
 
 ---
 
-*This plan targets the POC (Phase 1) for implementation. Phases 2-6 are directional and will be detailed when we get there.*
+## File Changes Summary
+
+```
+KEEP AS-IS:
+  agent/config/loader.py           ← team config loader (add bitbucket_token_env support)
+  agent/config/teams.json          ← team config (add bitbucket_token_env field)
+  agent/utils/bitbucket_mcp.py     ← MCP client (used by bitbucket_comment tool)
+  agent/review/tech_detector.py    ← utility
+  agent/review/role_selector.py    ← utility
+  agent/review/output.py           ← utility
+  agent/review/validator.py        ← utility
+
+REWRITE:
+  agent/webhooks/bitbucket.py      ← must create LangGraph runs, not call run_review()
+
+ADAPT:
+  agent/server.py                  ← add source=="bitbucket" branch in get_agent()
+  agent/prompt.py                  ← add review system prompt section
+  agent/config/loader.py           ← add bitbucket_token_env to TeamConfig
+
+NEW:
+  agent/tools/bitbucket_comment.py ← MCP-backed tool for posting review comments
+  agent/utils/bitbucket_auth.py    ← resolve Bitbucket token from team config
+
+DELETE:
+  agent/review/orchestrator.py     ← replaced by Deep Agent orchestration
+  agent/review/executor.py         ← replaced by `task` tool subagents
+  agent/review/poster.py           ← replaced by bitbucket_comment tool
+```
+
+---
+
+## Environment Variables
+
+```bash
+# Existing (keep)
+BITBUCKET_WEBHOOK_SECRET        # HMAC secret for webhook verification
+ANTHROPIC_API_KEY               # Claude API key
+TEAM_CONFIG_PATH                # Path to teams.json
+DK_MCP_ENDPOINT                 # AI Platform MCP URL
+DK_MCP_TOKEN                    # Default MCP bearer token
+
+# New
+BITBUCKET_HOST                  # Bitbucket DC hostname (default: bitbucket.dormakaba.net)
+DK_BITBUCKET_TOKEN              # Default Bitbucket HTTPS access token (fallback)
+LANGGRAPH_URL                   # LangGraph server URL for run creation
+SANDBOX_TYPE                    # Sandbox provider: langsmith, daytona, local, etc.
+
+# Per-team (in Azure App Service config)
+TEAM_ALPHA_MCP_TOKEN            # Team-specific MCP bearer token
+TEAM_ALPHA_BB_TOKEN             # Team-specific Bitbucket HTTPS access token
+```
+
+---
+
+## Deployment (Azure)
+
+- Azure Container Instances or App Service
+- Docker image based on existing Dockerfile
+- Webhook URL: `https://<app>.azurewebsites.net/webhooks/bitbucket`
+- Configure Bitbucket DC webhook → this URL, event: `pr:comment:added`
+- All secrets as Azure App Service environment variables
+
+---
+
+## Resolved Decisions
+
+1. **Framework alignment:** Full `get_agent()` + `create_deep_agent()` pattern per CUSTOMIZATION.md
+2. **Sandbox:** Yes, from Phase 1. `SANDBOX_TYPE` determines provider (local for dev, cloud for prod)
+3. **Clone:** HTTPS + per-repo access token, same credential helper pattern as framework's GitHub flow
+4. **Credential isolation:** System manages clone credentials; agent never sees them. MCP bearer token is the only credential the agent uses, and the MCP gateway controls tool access.
+5. **Subagents:** Via framework's built-in `task` tool, NOT direct `init_chat_model().ainvoke()`
+6. **Orchestration:** Via Deep Agent system prompt, NOT custom Python orchestrator
+7. **Review trigger:** `@dkai` in PR comments only (not PR description)
+8. **Re-review:** Full review each time `@dkai` is mentioned
+9. **Output:** Single summary comment, no inline comments (avoid PR clutter)
+10. **PR creation (future):** System-managed `commit_and_open_bb_pr` tool (Phase 3), same pattern as framework's `commit_and_open_pr` — uses system-held credentials the agent can't access directly
+11. **MCP scope (POC):** Only `add_comment` for writes. All code exploration is local in sandbox.
+12. **Jira:** Read-only via MCP `get_issue` tool — agent can fetch linked ticket for context
+
+---
+
+*This plan targets Phase 1 for implementation. Phases 2-5 are directional.*
