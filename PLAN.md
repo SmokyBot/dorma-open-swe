@@ -71,14 +71,15 @@ Extend the Open SWE Agent framework to support **Bitbucket Data Center** code re
 ┌─────────────────────────────────────────────────────────────┐
 │  Review Orchestrator (new graph node / agent)               │
 │  ─────────────────────────────────────────────────────────  │
-│  1. Fetch PR metadata via MCP (source/target branch, files) │
-│  2. Fetch full diff via MCP                                 │
-│  3. Fetch key file contents via MCP (for context)           │
-│  4. Auto-detect tech stack from file extensions + contents  │
-│  5. Select 2-6 review roles based on changes + tech stack   │
-│  6. Spawn independent review sub-agents (parallel)          │
-│  7. Collect findings, deduplicate, validate                 │
-│  8. Post single summary comment (table format, no inlines)  │
+│  1. Fetch PR metadata + diff via MCP                        │
+│  2. Auto-detect tech stack from changed files               │
+│  3. Read linked Jira ticket via MCP (if available)          │
+│  4. Select 2-6 review roles based on changes + tech stack   │
+│  5. Spawn independent review sub-agents (parallel)          │
+│     Each agent gets MCP tools to freely explore the repo    │
+│     (get_file_content, browse_repository, get_diff)         │
+│  6. Collect findings, deduplicate, validate                 │
+│  7. Post single summary comment (table format, no inlines)  │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -95,8 +96,7 @@ Extend the Open SWE Agent framework to support **Bitbucket Data Center** code re
       "name": "Team Alpha",
       "bitbucket_projects": ["WAD", "CORE"],
       "bitbucket_repos": ["vaude", "trinity-cloud"],
-      "mcp_endpoint": "https://ai-platform.dormakaba.net/mcp",
-      "mcp_api_key_env": "TEAM_ALPHA_MCP_KEY",
+      "mcp_token_env": "TEAM_ALPHA_MCP_TOKEN",
       "llm_provider": "anthropic",
       "llm_model": "claude-sonnet-4-20250514",
       "review_config": {
@@ -132,17 +132,26 @@ Register in `agent/webapp.py` alongside existing webhook routes.
 
 **File:** `agent/utils/bitbucket_mcp.py`
 
-Wrapper around MCP tool calls for Bitbucket operations:
-- `get_pr_details(project, repo, pr_id)` — PR metadata (source/target branch, title, description, author)
-- `get_pr_diff(project, repo, pr_id)` — Full diff content
-- `get_file_content(project, repo, file_path, ref)` — Fetch file at specific ref (for surrounding context)
-- `browse_repository(project, repo, path, ref)` — Explore repo structure for tech stack detection
-- `add_comment(project, repo, pr_id, text)` — Post summary review comment
-- `get_pr_comments(project, repo, pr_id)` — Fetch existing comments (context on re-review)
+Wrapper around MCP tool calls. Both Bitbucket and Jira tools are served from the **same** dormakaba AI Platform MCP server:
+
+- **MCP endpoint:** `https://ai-platform.dormakaba.net/api/mcp` (via APIM: `https://dk-ai-platform-apim.azure-api.net/mcp`)
+- **Auth:** Bearer token in `Authorization` header
+- **Protocol:** Standard MCP over HTTP (Streamable HTTP transport)
+
+**Bitbucket MCP tools (6 enabled):**
+- `get_pull_request` — PR metadata (source/target branch, title, description, author)
+- `get_diff` — Full diff content for the PR
+- `get_file_content` — Fetch any file at specific ref (agents use this freely to explore surrounding code)
+- `browse_repository` — Explore repo directory structure (tech stack detection, project understanding)
+- `add_comment` — Post summary review comment on the PR
+- `get_comments` — Fetch existing PR comments (context on re-review)
+
+**Jira MCP tools (read-only):**
+- `get_issue` — Read the linked Jira ticket (summary, description, acceptance criteria, status)
 
 **Not enabled (POC):** `add_comment_inline` (no inline comments to avoid PR clutter), `create_pull_request`, `merge_pull_request`, `decline_pull_request`, `approve_pull_request`, `delete_branch` (no write/destructive actions).
 
-This layer wraps MCP client calls (standard MCP protocol via `mcp` Python SDK) to the dormakaba AI Platform MCP server.
+**Key design:** Review sub-agents get direct access to `get_file_content` and `browse_repository` so they can autonomously explore the codebase as deep as needed — not limited to pre-fetched files.
 
 #### 4. Tech Stack Auto-Detection
 
@@ -261,7 +270,8 @@ New env vars:
 - `BITBUCKET_WEBHOOK_SECRET` — HMAC secret for webhook verification
 - `ANTHROPIC_API_KEY` — Claude subscription API key
 - `TEAM_CONFIG_PATH` — Path to teams.json (default: `agent/config/teams.json`)
-- Per-team MCP keys: `TEAM_{NAME}_MCP_KEY`
+- `DK_MCP_ENDPOINT` — AI Platform MCP URL (default: `https://dk-ai-platform-apim.azure-api.net/mcp`)
+- `DK_MCP_TOKEN` — Bearer token for AI Platform MCP (or per-team tokens via config)
 
 ### Deployment (Azure)
 
@@ -277,13 +287,10 @@ New env vars:
 2. **Review trigger:** `@dkai` in PR **comments only** (not PR description).
 3. **Re-review:** Full review every time `@dkai` is mentioned (no incremental logic).
 4. **Output:** Single summary comment only — no inline comments on the diff (avoid PR clutter).
-
-### Open Questions
-
-1. **Bitbucket webhook plugin:** Does the Bitbucket DC instance have `pr:comment:added` webhook event available natively, or do we need a plugin?
-2. **Rate limits:** Any rate limits on the Bitbucket API or MCP endpoint we should respect?
-3. **File content fetching:** For the no-sandbox POC, how many surrounding files should we fetch for context? (Suggest: changed files + their direct imports, up to ~50 files)
-4. **Jira access:** Should we add read-only Jira MCP tool so the agent can read the linked ticket for intent context?
+5. **Webhooks:** Bitbucket DC natively supports `Pull request > Comment added` event. No plugin needed.
+6. **Rate limits:** No concerns for POC.
+7. **Context depth:** Agent-driven exploration — review agents get direct MCP tool access to freely explore the repo, not just pre-fetched files. Reviews should assess the full feature context, project structure, and broader impact — not just changed lines.
+8. **Jira:** Yes — add read-only Jira MCP access so agents can read the linked ticket for intent and acceptance criteria.
 
 ---
 
